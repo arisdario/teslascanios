@@ -301,6 +301,128 @@ final class TeslaOBDManager: NSObject, ObservableObject {
         commandQueue.append(command)
         processQueueIfIdle()
     }
+
+    // MARK: - Diagnostic Trouble Codes (Mode 03 / 04)
+    //
+    // Standard OBD-II services: Mode 03 reads stored DTCs, Mode 04 clears
+    // them. HONEST CAVEAT: Tesla's onboard gateway is not required to
+    // implement these — they're emissions-diagnostic services from the ICE
+    // world, and an EV has no emissions system to report faults on. Some
+    // Teslas expose a subset for state-inspection compatibility, some don't.
+    // "NO DATA" or no response at all is inconclusive, not proof the car has
+    // no stored faults — it may just mean this service isn't implemented.
+    // Raw response text is always shown alongside any parsed codes so you can
+    // see exactly what came back rather than trusting the parser blindly.
+
+    @Published var dtcCodes: [String] = []
+    @Published var dtcRawResponse: [String] = []
+    @Published var dtcStatusMessage: String?
+    @Published var isReadingDTCs = false
+
+    private var awaitingDTCResponse = false
+    private var dtcResponseLines: [String] = []
+    private var wasMonitoringBeforeDTC = false
+    private var dtcModeWasClear = false
+
+    func readDTCs() {
+        guard isConnected, !isReadingDTCs else { return }
+        beginDTCExchange(clear: false)
+        send("03")
+    }
+
+    func clearDTCs() {
+        guard isConnected, !isReadingDTCs else { return }
+        beginDTCExchange(clear: true)
+        send("04")
+    }
+
+    private func beginDTCExchange(clear: Bool) {
+        isReadingDTCs = true
+        dtcModeWasClear = clear
+        dtcStatusMessage = nil
+        dtcCodes = []
+        dtcRawResponse = []
+        wasMonitoringBeforeDTC = isMonitoring
+        awaitingDTCResponse = true
+        dtcResponseLines = []
+        // Mode 03/04 needs the bus to itself — can't run alongside raw monitor
+        // mode. Stop monitoring, do the exchange, then resume where we left off.
+        stopMonitoring()
+    }
+
+    /// Called for each raw line while a DTC exchange is in flight, instead of
+    /// the normal CAN-frame parser (mode 03/04 responses aren't CAN monitor
+    /// frames and would otherwise get silently dropped or misread).
+    private func handleDTCLine(_ line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != ">" else { return }
+        dtcResponseLines.append(trimmed)
+    }
+
+    /// Runs once the '>' prompt confirms the DTC response is complete.
+    private func finalizeDTCExchange() {
+        dtcRawResponse = dtcResponseLines
+
+        let joined = dtcResponseLines.joined(separator: " ").uppercased()
+        if joined.contains("NO DATA") {
+            dtcStatusMessage = dtcModeWasClear
+                ? "No response to clear request — service may not be supported."
+                : "No response — either no stored codes, or this service isn't implemented on this vehicle."
+        } else if dtcModeWasClear {
+            if joined.contains("44") || joined.contains("OK") {
+                dtcStatusMessage = "Clear request acknowledged."
+            } else {
+                dtcStatusMessage = "Unclear response to clear request — see raw text below."
+            }
+        } else {
+            dtcCodes = Self.parseDTCResponse(dtcResponseLines)
+            dtcStatusMessage = dtcCodes.isEmpty
+                ? "No codes parsed. This may mean zero stored codes, or that the response format wasn't recognized — check the raw text below."
+                : "\(dtcCodes.count) code(s) found."
+        }
+
+        isReadingDTCs = false
+        awaitingDTCResponse = false
+        if wasMonitoringBeforeDTC {
+            monitorRange(filter: activeFilter, mask: activeMask)
+        }
+    }
+
+    /// Parses Mode 03 response lines into standard 5-character DTC strings
+    /// (e.g. "P0301"). Handles the common single-frame case; does not handle
+    /// multi-frame ISO-TP responses with many codes — if you have more DTCs
+    /// than fit in one frame, the raw text will show more than gets parsed.
+    private static func parseDTCResponse(_ lines: [String]) -> [String] {
+        var codes: [String] = []
+        for line in lines {
+            let hexOnly = line.filter { $0.isHexDigit }
+            guard hexOnly.count >= 2 else { continue }
+            var bytes: [UInt8] = []
+            var idx = hexOnly.startIndex
+            while idx < hexOnly.endIndex {
+                let next = hexOnly.index(idx, offsetBy: 2, limitedBy: hexOnly.endIndex) ?? hexOnly.endIndex
+                if let b = UInt8(hexOnly[idx..<next], radix: 16) { bytes.append(b) }
+                idx = next
+            }
+            // Find the "43" mode-response byte, then read DTC pairs after it.
+            guard let modeIdx = bytes.firstIndex(of: 0x43) else { continue }
+            var i = modeIdx + 1
+            while i + 1 < bytes.count {
+                let a = bytes[i], b = bytes[i + 1]
+                i += 2
+                if a == 0, b == 0 { continue } // padding
+                let categoryChars = ["P", "C", "B", "U"]
+                let category = categoryChars[Int((a >> 6) & 0x3)]
+                let digit1 = (a >> 4) & 0x3
+                let digit2 = a & 0xF
+                let digit3 = (b >> 4) & 0xF
+                let digit4 = b & 0xF
+                let code = String(format: "%@%X%X%X%X", category, digit1, digit2, digit3, digit4)
+                codes.append(code)
+            }
+        }
+        return codes
+    }
     
     private func decodeTeslaTelemetry(
         canID: UInt32,
