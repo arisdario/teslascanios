@@ -243,6 +243,59 @@ struct MoreView: View {
                             Text(unit.label).tag(unit)
                         }
                     }
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+
+                        Divider()
+
+                        Text("Diagnostics")
+                            .font(.headline)
+
+                        HStack {
+
+                            Button("Read DTCs") {
+                                obd.readDTCs()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!obd.isConnected || obd.isReadingDTCs)
+
+                            Button("Clear DTCs") {
+                                obd.clearDTCs()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(true)        // Keep disabled until we've verified Mode 03
+                        }
+
+                        if let status = obd.dtcStatusMessage {
+                            Text(status)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if !obd.dtcCodes.isEmpty {
+
+                            Text("Codes")
+                                .font(.caption)
+                                .bold()
+
+                            ForEach(obd.dtcCodes, id: \.self) { code in
+                                Text(code)
+                                    .font(.system(.body, design: .monospaced))
+                            }
+                        }
+
+                        if !obd.dtcRawResponse.isEmpty {
+
+                            Text("Raw Response")
+                                .font(.caption)
+                                .bold()
+
+                            ForEach(obd.dtcRawResponse, id: \.self) { line in
+                                Text(line)
+                                    .font(.system(.caption, design: .monospaced))
+                            }
+                        }
+                    }
                 }
 
                 
