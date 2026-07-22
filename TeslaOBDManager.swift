@@ -68,7 +68,7 @@ final class TeslaOBDManager: NSObject, ObservableObject {
 
     /// Rolling timestamped history, needed for the calibration/detective feature.
     @Published var frameLog: [(timestamp: Date, canID: UInt32, bytes: [UInt8])] = []
-    private let frameLogCap = 400000
+    private let frameLogCap = 10000
 
     // Fast-path internal storage: written on every frame (cheap, no UI cost),
     // then mirrored to the @Published properties above a few times per second.
@@ -304,126 +304,330 @@ final class TeslaOBDManager: NSObject, ObservableObject {
 
     // MARK: - Diagnostic Trouble Codes (Mode 03 / 04)
     //
-    // Standard OBD-II services: Mode 03 reads stored DTCs, Mode 04 clears
-    // them. HONEST CAVEAT: Tesla's onboard gateway is not required to
-    // implement these — they're emissions-diagnostic services from the ICE
-    // world, and an EV has no emissions system to report faults on. Some
-    // Teslas expose a subset for state-inspection compatibility, some don't.
-    // "NO DATA" or no response at all is inconclusive, not proof the car has
-    // no stored faults — it may just mean this service isn't implemented.
-    // Raw response text is always shown alongside any parsed codes so you can
-    // see exactly what came back rather than trusting the parser blindly.
+    // Standard OBD-II services: Mode 03 reads stored DTCs and Mode 04 clears
+    // them. Tesla-specific BMS/body/drive-unit faults normally use proprietary
+    // diagnostics instead, so a missing Mode 03/04 response is inconclusive.
 
-    @Published var dtcCodes: [String] = []
-    @Published var dtcRawResponse: [String] = []
-    @Published var dtcStatusMessage: String?
-    @Published var isReadingDTCs = false
+    @Published private(set) var dtcCodes: [String] = []
+    @Published private(set) var dtcRawResponse: [String] = []
+    @Published private(set) var dtcStatusMessage: String?
+    @Published private(set) var isReadingDTCs = false
 
-    private var awaitingDTCResponse = false
+    private enum DTCExchangeState {
+        case idle
+        case stoppingMonitor
+        case awaitingResponse
+    }
+
+    private var dtcExchangeState: DTCExchangeState = .idle
     private var dtcResponseLines: [String] = []
     private var wasMonitoringBeforeDTC = false
     private var dtcModeWasClear = false
+    private var dtcTimeoutWorkItem: DispatchWorkItem?
+    private let dtcTimeoutSeconds: TimeInterval = 8
 
     func readDTCs() {
-        guard isConnected, !isReadingDTCs else { return }
         beginDTCExchange(clear: false)
-        send("03")
     }
 
     func clearDTCs() {
-        guard isConnected, !isReadingDTCs else { return }
         beginDTCExchange(clear: true)
-        send("04")
     }
 
     private func beginDTCExchange(clear: Bool) {
+        guard isConnected else {
+            dtcStatusMessage = "OBD adapter is not connected."
+            return
+        }
+        guard dtcExchangeState == .idle, !isReadingDTCs else { return }
+
         isReadingDTCs = true
         dtcModeWasClear = clear
-        dtcStatusMessage = nil
         dtcCodes = []
         dtcRawResponse = []
-        wasMonitoringBeforeDTC = isMonitoring
-        awaitingDTCResponse = true
         dtcResponseLines = []
-        // Mode 03/04 needs the bus to itself — can't run alongside raw monitor
-        // mode. Stop monitoring, do the exchange, then resume where we left off.
-        stopMonitoring()
+        wasMonitoringBeforeDTC = isMonitoring
+        dtcStatusMessage = clear
+            ? "Preparing to send Mode 04 clear request…"
+            : "Preparing to read Mode 03 stored codes…"
+
+        cancelDTCTimeout()
+
+        if isMonitoring {
+            // The first prompt belongs to stopping ATMA, not to Mode 03/04.
+            dtcExchangeState = .stoppingMonitor
+            stopMonitoring()
+            scheduleDTCTimeout()
+        } else {
+            sendDTCCommand()
+        }
     }
 
-    /// Called for each raw line while a DTC exchange is in flight, instead of
-    /// the normal CAN-frame parser (mode 03/04 responses aren't CAN monitor
-    /// frames and would otherwise get silently dropped or misread).
+    private func sendDTCCommand() {
+        guard isConnected, isReadingDTCs else {
+            abortDTCExchange(message: "Connection was lost before the diagnostic request was sent.")
+            return
+        }
+
+        dtcResponseLines = []
+        dtcExchangeState = .awaitingResponse
+        dtcStatusMessage = dtcModeWasClear
+            ? "Sending Mode 04 clear request…"
+            : "Reading stored codes with Mode 03…"
+        send(dtcModeWasClear ? "04" : "03")
+        scheduleDTCTimeout()
+    }
+
+    /// Routes a complete adapter line while a Mode 03/04 exchange is active.
+    /// Command echoes are ignored so the raw result contains only responses.
     private func handleDTCLine(_ line: String) {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed != ">" else { return }
+        guard !trimmed.isEmpty else { return }
+
+        let normalized = trimmed
+            .replacingOccurrences(of: " ", with: "")
+            .uppercased()
+        guard normalized != "03", normalized != "04" else { return }
+
         dtcResponseLines.append(trimmed)
     }
 
-    /// Runs once the '>' prompt confirms the DTC response is complete.
-    private func finalizeDTCExchange() {
-        dtcRawResponse = dtcResponseLines
+    /// Called whenever the ELM prompt is received. The first prompt may only
+    /// confirm that monitor mode stopped; the second completes Mode 03/04.
+    private func handleAdapterPrompt() {
+        isWaitingForResponse = false
 
+        switch dtcExchangeState {
+        case .idle:
+            processQueueIfIdle()
+
+        case .stoppingMonitor:
+            cancelDTCTimeout()
+            sendDTCCommand()
+
+        case .awaitingResponse:
+            cancelDTCTimeout()
+            finalizeDTCExchange()
+        }
+    }
+
+    private func finalizeDTCExchange() {
+        guard dtcExchangeState == .awaitingResponse else { return }
+
+        dtcRawResponse = dtcResponseLines
         let joined = dtcResponseLines.joined(separator: " ").uppercased()
-        if joined.contains("NO DATA") {
-            dtcStatusMessage = dtcModeWasClear
-                ? "No response to clear request — service may not be supported."
-                : "No response — either no stored codes, or this service isn't implemented on this vehicle."
+
+        if containsDTCAdapterError(joined) {
+            dtcCodes = []
+            dtcStatusMessage = dtcAdapterErrorMessage(for: joined)
         } else if dtcModeWasClear {
-            if joined.contains("44") || joined.contains("OK") {
-                dtcStatusMessage = "Clear request acknowledged."
+            let bytes = Self.extractOBDResponseBytes(
+                from: dtcResponseLines,
+                expectedModeResponse: 0x44
+            )
+            if bytes.contains(0x44) || Self.containsStandaloneOK(joined) {
+                dtcStatusMessage = "Mode 04 clear request acknowledged. This does not confirm that Tesla-specific ECU faults were cleared."
             } else {
-                dtcStatusMessage = "Unclear response to clear request — see raw text below."
+                dtcStatusMessage = "The Mode 04 response was not recognized — check the raw response."
             }
         } else {
             dtcCodes = Self.parseDTCResponse(dtcResponseLines)
             dtcStatusMessage = dtcCodes.isEmpty
-                ? "No codes parsed. This may mean zero stored codes, or that the response format wasn't recognized — check the raw text below."
-                : "\(dtcCodes.count) code(s) found."
+                ? "No standard Mode 03 codes were parsed. This may mean no generic codes, an unsupported service, or an unrecognized response format."
+                : "\(dtcCodes.count) stored code(s) found."
         }
+
+        finishDTCExchange()
+    }
+
+    private func finishDTCExchange() {
+        cancelDTCTimeout()
+        let shouldResume = wasMonitoringBeforeDTC && isConnected
 
         isReadingDTCs = false
-        awaitingDTCResponse = false
-        if wasMonitoringBeforeDTC {
+        dtcExchangeState = .idle
+        dtcResponseLines = []
+        wasMonitoringBeforeDTC = false
+
+        if shouldResume {
             monitorRange(filter: activeFilter, mask: activeMask)
+        } else {
+            processQueueIfIdle()
         }
     }
 
-    /// Parses Mode 03 response lines into standard 5-character DTC strings
-    /// (e.g. "P0301"). Handles the common single-frame case; does not handle
-    /// multi-frame ISO-TP responses with many codes — if you have more DTCs
-    /// than fit in one frame, the raw text will show more than gets parsed.
+    private func abortDTCExchange(message: String) {
+        dtcRawResponse = dtcResponseLines
+        dtcStatusMessage = message
+        finishDTCExchange()
+    }
+
+    private func scheduleDTCTimeout() {
+        cancelDTCTimeout()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.dtcExchangeState != .idle else { return }
+            self.abortDTCExchange(message: "The OBD adapter did not complete the diagnostic request.")
+        }
+        dtcTimeoutWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + dtcTimeoutSeconds, execute: item)
+    }
+
+    private func cancelDTCTimeout() {
+        dtcTimeoutWorkItem?.cancel()
+        dtcTimeoutWorkItem = nil
+    }
+
+    private func containsDTCAdapterError(_ response: String) -> Bool {
+        ["NO DATA", "UNABLE TO CONNECT", "BUS ERROR", "CAN ERROR",
+         "STOPPED", "ERROR", "BUFFER FULL", "BUS INIT"]
+            .contains { response.contains($0) }
+    }
+
+    private func dtcAdapterErrorMessage(for response: String) -> String {
+        if response.contains("NO DATA") {
+            return dtcModeWasClear
+                ? "No response to Mode 04 — the service may not be supported."
+                : "No response to Mode 03 — there may be no generic codes, or the service may not be implemented."
+        }
+        if response.contains("UNABLE TO CONNECT") { return "The adapter could not establish an OBD-II connection." }
+        if response.contains("BUS ERROR") || response.contains("CAN ERROR") { return "The adapter reported a CAN bus error." }
+        if response.contains("STOPPED") { return "The adapter stopped the diagnostic request." }
+        return "The adapter reported an error — check the raw response."
+    }
+
+    private static func containsStandaloneOK(_ response: String) -> Bool {
+        response.components(separatedBy: .whitespacesAndNewlines).contains("OK")
+    }
+
     private static func parseDTCResponse(_ lines: [String]) -> [String] {
+        let bytes = extractOBDResponseBytes(from: lines, expectedModeResponse: 0x43)
+        guard let modeIndex = bytes.firstIndex(of: 0x43) else { return [] }
+
         var codes: [String] = []
+        var index = modeIndex + 1
+        while index + 1 < bytes.count {
+            let highByte = bytes[index]
+            let lowByte = bytes[index + 1]
+            index += 2
+            guard highByte != 0 || lowByte != 0 else { continue }
+            codes.append(formatDTC(highByte: highByte, lowByte: lowByte))
+        }
+
+        var seen = Set<String>()
+        return codes.filter { seen.insert($0).inserted }
+    }
+
+    private static func formatDTC(highByte: UInt8, lowByte: UInt8) -> String {
+        let categories = ["P", "C", "B", "U"]
+        let category = categories[Int((highByte >> 6) & 0x03)]
+        return String(
+            format: "%@%X%X%X%X",
+            category,
+            (highByte >> 4) & 0x03,
+            highByte & 0x0F,
+            (lowByte >> 4) & 0x0F,
+            lowByte & 0x0F
+        )
+    }
+
+    /// Reassembles common ELM Mode 03/04 output, including optional CAN headers
+    /// and basic ISO-TP single/first/consecutive frames.
+    private static func extractOBDResponseBytes(
+        from lines: [String],
+        expectedModeResponse: UInt8
+    ) -> [UInt8] {
+        var result: [UInt8] = []
+        var isoTPPayload: [UInt8] = []
+        var expectedISOTPLength: Int?
+
         for line in lines {
-            let hexOnly = line.filter { $0.isHexDigit }
-            guard hexOnly.count >= 2 else { continue }
-            var bytes: [UInt8] = []
-            var idx = hexOnly.startIndex
-            while idx < hexOnly.endIndex {
-                let next = hexOnly.index(idx, offsetBy: 2, limitedBy: hexOnly.endIndex) ?? hexOnly.endIndex
-                if let b = UInt8(hexOnly[idx..<next], radix: 16) { bytes.append(b) }
-                idx = next
-            }
-            // Find the "43" mode-response byte, then read DTC pairs after it.
-            guard let modeIdx = bytes.firstIndex(of: 0x43) else { continue }
-            var i = modeIdx + 1
-            while i + 1 < bytes.count {
-                let a = bytes[i], b = bytes[i + 1]
-                i += 2
-                if a == 0, b == 0 { continue } // padding
-                let categoryChars = ["P", "C", "B", "U"]
-                let category = categoryChars[Int((a >> 6) & 0x3)]
-                let digit1 = (a >> 4) & 0x3
-                let digit2 = a & 0xF
-                let digit3 = (b >> 4) & 0xF
-                let digit4 = b & 0xF
-                let code = String(format: "%@%X%X%X%X", category, digit1, digit2, digit3, digit4)
-                codes.append(code)
+            guard let frameBytes = parseAdapterHexLine(line), !frameBytes.isEmpty else { continue }
+
+            let pciType = frameBytes[0] >> 4
+            switch pciType {
+            case 0x0:
+                let length = Int(frameBytes[0] & 0x0F)
+                guard length > 0, frameBytes.count >= length + 1 else { continue }
+                let payload = Array(frameBytes[1...length])
+                if payload.contains(expectedModeResponse) { result.append(contentsOf: payload) }
+
+            case 0x1:
+                guard frameBytes.count >= 2 else { continue }
+                expectedISOTPLength = (Int(frameBytes[0] & 0x0F) << 8) | Int(frameBytes[1])
+                isoTPPayload = Array(frameBytes.dropFirst(2))
+
+            case 0x2:
+                guard let expectedLength = expectedISOTPLength else { continue }
+                isoTPPayload.append(contentsOf: frameBytes.dropFirst())
+                if isoTPPayload.count >= expectedLength {
+                    let payload = Array(isoTPPayload.prefix(expectedLength))
+                    if payload.contains(expectedModeResponse) { result.append(contentsOf: payload) }
+                    isoTPPayload = []
+                    expectedISOTPLength = nil
+                }
+
+            default:
+                if frameBytes.contains(expectedModeResponse) { result.append(contentsOf: frameBytes) }
             }
         }
-        return codes
+        return result
     }
-    
+
+    private static func parseAdapterHexLine(_ line: String) -> [UInt8]? {
+        var cleaned = line.uppercased()
+            .replacingOccurrences(of: ">", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .replacingOccurrences(of: ":", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let informational = ["SEARCHING", "BUS INIT", "NO DATA", "STOPPED", "UNABLE", "ERROR", "OK"]
+        guard !informational.contains(where: { cleaned.contains($0) }) else { return nil }
+
+        var tokens = cleaned.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard !tokens.isEmpty else { return nil }
+
+        if let first = tokens.first,
+           (first.count == 3 || first.count == 8),
+           UInt32(first, radix: 16) != nil {
+            tokens.removeFirst()
+        }
+
+        if let first = tokens.first, first.count == 1, UInt8(first, radix: 16) != nil {
+            tokens.removeFirst()
+        }
+
+        // ATS0 may return a single compact token. Split it into byte pairs.
+        if tokens.count == 1 {
+            var token = tokens[0]
+
+            // With ATH1 + ATS0, adapters commonly return a compact 11-bit
+            // header followed by ISO-TP bytes, e.g. "7E806430123000000".
+            // Remove the three-nibble CAN ID only when the remainder is byte-aligned.
+            if token.count >= 5,
+               token.count % 2 == 1,
+               token.prefix(3).allSatisfy({ $0.isHexDigit }) {
+                token = String(token.dropFirst(3))
+            }
+
+            guard token.count % 2 == 0, token.allSatisfy({ $0.isHexDigit }) else { return nil }
+            var bytes: [UInt8] = []
+            var index = token.startIndex
+            while index < token.endIndex {
+                let next = token.index(index, offsetBy: 2)
+                guard let byte = UInt8(token[index..<next], radix: 16) else { return nil }
+                bytes.append(byte)
+                index = next
+            }
+            return bytes.isEmpty ? nil : bytes
+        }
+
+        let bytes = tokens.compactMap { token -> UInt8? in
+            guard token.count == 2 else { return nil }
+            return UInt8(token, radix: 16)
+        }
+        return bytes.isEmpty ? nil : bytes
+    }
+
     private func decodeTeslaTelemetry(
         canID: UInt32,
         payload: [UInt8],
@@ -852,6 +1056,9 @@ extension TeslaOBDManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         isConnected = false
+        if dtcExchangeState != .idle {
+            abortDTCExchange(message: "The adapter disconnected during the DTC exchange.")
+        }
         statusText = "Disconnected"
     }
 }
@@ -985,20 +1192,37 @@ extension TeslaOBDManager: CBPeripheralDelegate {
             rxBuffer = String(rxBuffer.suffix(2048))
         }
 
-        if rxBuffer.contains(">") {
-            isWaitingForResponse = false
-            processQueueIfIdle()
+        // Treat CR, LF and the ELM prompt as independent delimiters. A prompt
+        // can be attached directly to the final response line, so looking only
+        // for a standalone ">" line loses the DTC completion boundary.
+        var current = ""
+
+        for character in rxBuffer {
+            if character == "\r" || character == "\n" {
+                if !current.isEmpty {
+                    if dtcExchangeState == .awaitingResponse {
+                        handleDTCLine(current)
+                    } else if dtcExchangeState == .idle {
+                        parseLine(current)
+                    }
+                    current = ""
+                }
+            } else if character == ">" {
+                if !current.isEmpty {
+                    if dtcExchangeState == .awaitingResponse {
+                        handleDTCLine(current)
+                    } else if dtcExchangeState == .idle {
+                        parseLine(current)
+                    }
+                    current = ""
+                }
+                handleAdapterPrompt()
+            } else {
+                current.append(character)
+            }
         }
 
-        // Split on CR *or* LF — some adapters use one, some the other, some both.
-        // Replace both with a single separator, then process complete lines.
-        let normalized = rxBuffer.replacingOccurrences(of: "\n", with: "\r")
-        let segments = normalized.components(separatedBy: "\r")
-        // All but the last segment are complete lines; the last is a partial
-        // that we keep buffered until its terminator arrives.
-        for line in segments.dropLast() {
-            parseLine(line)
-        }
-        rxBuffer = segments.last ?? ""
+        // All characters were inspected. Keep only the unterminated tail.
+        rxBuffer = current
     }
 }
